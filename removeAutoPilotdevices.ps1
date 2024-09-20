@@ -21,6 +21,102 @@ function Check-Module ($m) {
             Write-Host "`nModule $m is available." -ForegroundColor Green
         }
     }
+
+    function getallpagination () {
+        [cmdletbinding()]
+            
+        param
+        (
+            $url
+        )
+            $response = (Invoke-MgGraphRequest -uri $url -Method Get -OutputType PSObject)
+            $alloutput = $response.value
+            
+            $alloutputNextLink = $response."@odata.nextLink"
+            
+            while ($null -ne $alloutputNextLink) {
+                $alloutputResponse = (Invoke-MGGraphRequest -Uri $alloutputNextLink -Method Get -outputType PSObject)
+                $alloutputNextLink = $alloutputResponse."@odata.nextLink"
+                $alloutput += $alloutputResponse.value
+            }
+            
+            return $alloutput
+            }
+
+            Function Connect-ToGraph {
+                <#
+            .SYNOPSIS
+            Authenticates to the Graph API via the Microsoft.Graph.Authentication module.
+             
+            .DESCRIPTION
+            The Connect-ToGraph cmdlet is a wrapper cmdlet that helps authenticate to the Intune Graph API using the Microsoft.Graph.Authentication module. It leverages an Azure AD app ID and app secret for authentication or user-based auth.
+             
+            .PARAMETER Tenant
+            Specifies the tenant (e.g. contoso.onmicrosoft.com) to which to authenticate.
+             
+            .PARAMETER AppId
+            Specifies the Azure AD app ID (GUID) for the application that will be used to authenticate.
+             
+            .PARAMETER AppSecret
+            Specifies the Azure AD app secret corresponding to the app ID that will be used to authenticate.
+            
+            .PARAMETER Scopes
+            Specifies the user scopes for interactive authentication.
+             
+            .EXAMPLE
+            Connect-ToGraph -TenantId $tenantID -AppId $app -AppSecret $secret
+             
+            -#>
+                [cmdletbinding()]
+                param
+                (
+                    [Parameter(Mandatory = $false)] [string]$Tenant,
+                    [Parameter(Mandatory = $false)] [string]$AppId,
+                    [Parameter(Mandatory = $false)] [string]$AppSecret,
+                    [Parameter(Mandatory = $false)] [string]$scopes
+                )
+            
+                Process {
+                    Import-Module Microsoft.Graph.Authentication
+                    $version = (get-module microsoft.graph.authentication | Select-Object -expandproperty Version).major
+            
+                    if ($AppId -ne "") {
+                        $body = @{
+                            grant_type    = "client_credentials";
+                            client_id     = $AppId;
+                            client_secret = $AppSecret;
+                            scope         = "https://graph.microsoft.com/.default";
+                        }
+                 
+                        $response = Invoke-RestMethod -Method Post -Uri https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token -Body $body
+                        $accessToken = $response.access_token
+                 
+                        $accessToken
+                        if ($version -eq 2) {
+                            write-host "Version 2 module detected"
+                            $accesstokenfinal = ConvertTo-SecureString -String $accessToken -AsPlainText -Force
+                        }
+                        else {
+                            write-host "Version 1 Module Detected"
+                            Select-MgProfile -Name Beta
+                            $accesstokenfinal = $accessToken
+                        }
+                        $graph = Connect-MgGraph  -AccessToken $accesstokenfinal 
+                        Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                    }
+                    else {
+                        if ($version -eq 2) {
+                            write-host "Version 2 module detected"
+                        }
+                        else {
+                            write-host "Version 1 Module Detected"
+                            Select-MgProfile -Name Beta
+                        }
+                        $graph = Connect-MgGraph -scopes $scopes
+                        Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                    }
+                }
+            }   
     
     # Clear screen and write info on screen
     Clear-Host
@@ -31,12 +127,14 @@ function Check-Module ($m) {
     
     # Checking if required modules are installed
     # If there are any errors, make sure to install the modules first with:
-    #   Install-Module -Name Microsoft.Graph
-    #   Install-Module -Name WindowsAutoPilotIntune
+    #   Install-Module -Name Microsoft.Graph.Authentication
+    #   Install-Module -Name WindowsAutoPilotIntuneCommunity
+
+
     
     Write-Host "`nChecking if required modules are installed."
-    Check-Module("Microsoft.Graph")
-    Check-Module("WindowsAutoPilotIntune")
+    Check-Module("Microsoft.Graph.Authentication")
+    Check-Module("WindowsAutoPilotIntuneCommunity")
     
     
     # Connect with Microsoft services
@@ -44,26 +142,8 @@ function Check-Module ($m) {
     Write-Host "`nConnecting to Microsoft services. Enter your credentials."
     
     Write-Host "`nConnecting to MgGraph`n"		
-    Connect-MgGraph -NoWelcome
-    
-    # Connecting with MSGraph might give a problem if module Microsoft.Graph.Intune is not imported
-    try {
-        Write-Host "Connecting to MSGraph"
-        Connect-MSGraph
-    } 
-    catch {
-        Write-Host "`nCould not execute Connect-MSGraph." -ForegroundColor Red
-        Write-Host "Importing module and trying again.`n" -ForegroundColor Red
-        Import-Module Microsoft.Graph.Intune
-            
-        try {
-            Connect-MSGraph        		
-        }
-        catch {
-            Write-Host "Unexpected error: could still not execute Connect-MSGraph.`n`n" -ForegroundColor Red
-            Exit 1
-        }
-    }
+Connect-ToGraph -scopes "DeviceManagementConfiguration.ReadWrite.All,DeviceManagementManagedDevices.ReadWrite.All,DeviceManagementConfiguration.Read.All,DeviceManagementManagedDevices.Read.All,Directory.Read.All,Directory.ReadWrite.All,User.Read.All,User.ReadWrite.All"
+
     
     # Paths to files
     $csvPath = ".\serialNumbers.csv"        # This csv-file contains the serial numbers of the AutoPilot devices. Each serial number has to be stored on a seperate line.
@@ -79,7 +159,8 @@ function Check-Module ($m) {
     
     # Retrieve al Microsoft Graph devices
     Write-Host "Retrieving all Microsoft Graph devices.`n"	
-    $allmgdevices = Get-MgDevice -All
+    $allmanageddevices = getallpagination -url "https://graph.microsoft.com/beta/devicemanagement/manageddevices"
+    $allmgdevices = getallpagination -url "https://graph.microsoft.com/beta/devices"
     
     Write-Host "Deleting all devices by serial number.`n"	
     
@@ -101,8 +182,8 @@ function Check-Module ($m) {
             
             # Remove the Intune managed device
             Write-Host "Removing from Intune" 
-            try {                
-                Remove-IntuneManagedDevice -managedDeviceId $apmanageddeviceid	
+            try {               
+                Invoke-MgGraphRequest -uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$apmanageddeviceid" -Method Delete 
             }
             catch {
                 Write-Host "Could not remove from Intune devicelist. The device might have been already deleted manually in Intune." -ForegroundColor Red
@@ -115,6 +196,8 @@ function Check-Module ($m) {
             # Remove the Azure AD device
             Write-Host "Removing from AzureAD`n`n"            
             $mgdevice = $allmgdevices | Where-Object { $_.DeviceId -eq $apdeviceid }
+            $mgdeviceid = $mgdevice.id
+            Invoke-MgGraphRequest -uri "https://graph.microsoft.com/beta/devices/$mgdeviceid" -Method Delete
             Remove-MgDevice -DeviceID $mgdevice.id
     
         } else { # Device was not found
